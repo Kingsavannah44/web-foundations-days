@@ -13,9 +13,10 @@
 
 ### Non-Functional Requirements
 - **Availability:** 99.9% uptime; the system must stay responsive even during high-demand on-sales.
-- **Consistency:** No two users may purchase the same seat. The seat reservation must be atomic.
-- **Latency:** Normal page loads under 200 ms; checkout response under 500 ms.
-- **Scalability:** Must handle sudden 40× traffic spikes when a popular event goes on sale.
+- **Correctness:** No two users may ever purchase the same seat. The seat reservation must be atomic at the database level — no application-level check is sufficient.
+- **Fairness:** Every user who arrives during an on-sale should have an equal chance of buying a seat. No single user or bot should be able to hold a disproportionate number of seats. A queue-based virtual waiting room can enforce first-come-first-served order at extreme scale.
+- **Speed:** Normal page loads under 200 ms; checkout response under 500 ms even during peak.
+- **Scalability:** Must handle sudden ~280× traffic spikes when a popular event goes on sale without degrading latency or correctness.
 - **Durability:** No booking data must ever be lost once a payment is confirmed.
 
 ---
@@ -268,6 +269,24 @@ The `WHERE status = 'available'` clause is the guard. If two users submit reques
 | **Read Replica** | Handles read queries (event listings, booking history) so the primary can dedicate I/O to the write-heavy checkout path. |
 | **Queue** | Decouples confirmation emails from the checkout response so slow email delivery never delays the user getting their booking reference. |
 | **Email Worker** | Consumes jobs from the queue and sends booking confirmation emails with e-tickets, without blocking the checkout flow. |
+
+---
+
+### How the Architecture Survives the Big Sale
+
+On a normal day the system handles ~6 page views/s and one purchase every 17 seconds. During a popular on-sale, 200,000 users arrive inside 10 minutes, pushing the load to ~1,667 requests/s and ~333 checkout attempts/s — roughly a **278× spike**. Here is how each layer absorbs it:
+
+1. **CDN absorbs ~90% of traffic before it reaches the origin.** Event pages, venue images and the seating chart are static content that the CDN cached before the sale opened. Most of the 200,000 users never hit the app servers just to browse.
+
+2. **App servers scale horizontally.** Because app servers are stateless (no session stored on the server), the load balancer can route any request to any instance. New instances can be provisioned in under a minute using auto-scaling, so the fleet grows with the spike and shrinks when it passes.
+
+3. **Redis absorbs seat-availability reads.** Seat counts and event metadata are served from cache. The database primary is never asked "how many seats are left?" on every page load from 200,000 users simultaneously.
+
+4. **The database primary only handles checkout writes.** With browsing traffic diverted to the CDN and Redis, and read queries going to the read replica, the primary's entire I/O budget is dedicated to the ~333 atomic seat-reservation updates per second at peak. This is a manageable write load for a modern PostgreSQL instance.
+
+5. **Row-level locking prevents double-selling under any load.** Even at 333 concurrent checkout attempts/s, the `UPDATE … WHERE status = 'available'` constraint means only one transaction can claim any given seat. The others immediately receive a `409 Conflict` — no seat is ever sold twice, regardless of how many users are trying at once.
+
+6. **The queue protects email infrastructure.** Sending 20,000 confirmation emails in a few minutes would overwhelm a direct SMTP connection. The queue absorbs the burst and the email worker drains it steadily, keeping confirmation delivery reliable without blocking checkouts.
 
 ---
 
